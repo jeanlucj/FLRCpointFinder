@@ -1,0 +1,75 @@
+---
+title: "FLRCpointFinder"
+author: "Jean-Luc Jannink"
+date: "6/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load packages  
+```{r load packages, message=FALSE}
+ip <- installed.packages()
+packages_used <- c("tidyverse", "workflowr", "here", "lme4")
+for (package in packages_used){
+  if (!(package %in% ip[,"Package"])) install.packages(package)
+}
+library(tidyverse)
+
+here::i_am("analysis/FLRCpointFinder.Rmd")
+
+random_seed <- 45678
+set.seed(random_seed)
+```
+
+### Get data from the webscorer API
+```{r Webscorer API}
+courseData <- jsonlite::fromJSON(here::here("data", "CourseInfo.txt"))$Courses
+apiURL <- "https://api.webscorer.com/racetimer/webscorerapi/results?raceid="
+activity <- tibble()
+for (rID in courseData$ID){
+  rawWS <- jsonlite::fromJSON(paste0(apiURL, rID))$Racers
+  rawWS <- rawWS %>% mutate(Course=courseData$Name[courseData$ID==rID])
+  activity <- activity %>% bind_rows(as_tibble(rawWS) %>% 
+                                   select(Course, Name, RaceTime))
+}
+```
+
+### Find fastest times per person per course
+```{r Fastest times}
+athCrs <- activity %>% select(Name, Course) %>% distinct
+fastest <- function(ac){
+  oneAC <- activity %>% filter(Name==unlist(ac[1]) & Course==unlist(ac[2]))
+  return((oneAC %>% filter(RaceTime==min(RaceTime)))[1,])
+}
+acList <- apply(athCrs, 1, fastest)
+fastestAC <- tibble(course=sapply(acList, function(tbl) unlist(tbl[1])),
+                    athlete=sapply(acList, function(tbl) unlist(tbl[2])),
+                    timeSec=sapply(acList, function(tbl) unlist(tbl[3]))
+                    )
+fastestAC <- fastestAC %>% filter(timeSec != 0)
+```
+
+### Analyse the times
+```{r Analyse times}
+fastestAC <- fastestAC %>% mutate(logTS=log(timeSec))
+fm <- lme4::lmer(logTS ~ course + (1 | athlete), data=fastestAC)
+fastestAC <- fastestAC %>% mutate(deviation=resid(fm)) %>% 
+  filter(deviation > -1)
+fm <- lme4::lmer(logTS ~ course + (1 | athlete), data=fastestAC)
+fastestAC <- fastestAC %>% mutate(deviation=resid(fm)) 
+```
+
+### Take a name, give a table
+```{r Name to table}
+name="Jean-Luc Jannink"
+devTab <- fastestAC %>% filter(athlete == name) %>% arrange(timeSec) %>% 
+  mutate(devPercent=round(deviation*100, 1)) %>% 
+  select(course, athlete, timeSec, devPercent) %>% 
+  mutate(targetSec=-round(timeSec*devPercent/100, 0)) %>% 
+  mutate(targetSec=if_else(targetSec < 0, targetSec, 0))
+print(devTab)
+```
+

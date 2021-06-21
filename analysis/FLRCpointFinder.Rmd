@@ -22,19 +22,65 @@ here::i_am("analysis/FLRCpointFinder.Rmd")
 
 random_seed <- 45678
 set.seed(random_seed)
+
+key <- function(tbl, var, key){
+  return(tbl[tbl %>% select(any_of(var)) == key,])
+}
 ```
 
 ### Get data from the webscorer API
 ```{r Webscorer API}
 courseData <- jsonlite::fromJSON(here::here("data", "CourseInfo.txt"))$Courses
+courseData <- courseData %>% dplyr::mutate(Type=if_else(Type == "Mixed", "Road", Type))
 apiURL <- "https://api.webscorer.com/racetimer/webscorerapi/results?raceid="
 activity <- tibble()
 for (rID in courseData$ID){
   rawWS <- jsonlite::fromJSON(paste0(apiURL, rID))$Racers
-  rawWS <- rawWS %>% mutate(Course=courseData$Name[courseData$ID==rID])
+  rawWS <- rawWS %>% dplyr::mutate(Course=courseData$Name[courseData$ID==rID])
   activity <- activity %>% bind_rows(as_tibble(rawWS) %>% 
                                    select(Course, Name, RaceTime))
 }
+activity$Name[activity$Name == "akp84@cornell.edu"] <- "Adam Pacheck"
+activity$Name[activity$Name == "adam.schoene@gmail.com"] <- "Adam Schoene"
+```
+
+### Curate the times
+I'm using here an arbitrary cutoff of -5 for the studentized residual, but
+eyeballing the outcome of the curation makes me believe that's right.  It
+gets rid of times that are way too fast
+```{r Analyse times}
+activity <- activity %>% filter(RaceTime != 0) %>% dplyr::mutate(logTS=log(RaceTime))
+fm <- lme4::lmer(logTS ~ Course + (1 | Name), data=activity)
+activity <- activity %>% dplyr::mutate(stdntRes=resid(fm) / sigma(fm)) %>% 
+  filter(stdntRes > -5)
+fm <- lme4::lmer(logTS ~ Course + (1 | Name), data=activity)
+activity <- activity %>% dplyr::mutate(stdntRes=resid(fm) / sigma(fm)) 
+print(activity %>% filter(abs(stdntRes) > 3))
+```
+
+### Figure out the course time
+For each course by athlete combination:  
+1. If there are >1 times, take off the slowest
+2. If there are >3 times, take off the fastest
+3. Run the analysis with course as a fixed effect
+```{r Trimmed times analysis}
+athCrs <- activity %>% select(Name, Course) %>% distinct
+trimmed <- function(ac){
+  oneAC <- activity %>% filter(Name==unlist(ac[1]) & Course==unlist(ac[2])) %>% 
+    arrange(logTS)
+  nTimes <- nrow(oneAC)
+  if (nTimes > 1) oneAC <- oneAC[-nTimes,]
+  if (nTimes > 3) oneAC <- oneAC[-1,]
+  return(oneAC)
+}
+acList <- apply(athCrs, 1, trimmed)
+trimAC <- tibble()
+dummy <- sapply(acList, function(tbl) trimAC <<- bind_rows(trimAC, tbl))
+rm(dummy)
+fm <- lme4::lmer(logTS ~ -1 + Course + (1 | Name), data=trimAC)
+courseCov <- scale(lme4::fixef(fm), center=T, scale=F)
+rownames(courseCov) <- substring(rownames(courseCov), 7)
+courseData <- courseData %>% dplyr::mutate(courseTime = courseCov[Name, 1])
 ```
 
 ### Find fastest times per person per course
@@ -54,22 +100,34 @@ fastestAC <- fastestAC %>% filter(timeSec != 0)
 
 ### Analyse the times
 ```{r Analyse times}
-fastestAC <- fastestAC %>% mutate(logTS=log(timeSec))
-fm <- lme4::lmer(logTS ~ course + (1 | athlete), data=fastestAC)
-fastestAC <- fastestAC %>% mutate(deviation=resid(fm)) %>% 
-  filter(deviation > -1)
-fm <- lme4::lmer(logTS ~ course + (1 | athlete), data=fastestAC)
-fastestAC <- fastestAC %>% mutate(deviation=resid(fm)) 
+fastestAC <- fastestAC %>% dplyr::mutate(logTS=log(timeSec),
+  courseType=sapply(fastestAC$course, function(k) key(courseData, "Name", k)$Type),
+  courseTime=sapply(fastestAC$course, function(k) key(courseData, "Name", k)$courseTime))
+trimAC <- trimAC %>% dplyr::mutate(
+  courseType=sapply(trimAC$Course, function(k) key(courseData, "Name", k)$Type),
+  courseTime=sapply(trimAC$Course, function(k) key(courseData, "Name", k)$courseTime))
+fm_ftp <- lme4::lmer(logTS ~ course + 
+                   (1 + courseType | athlete), data=fastestAC)
+ran_ftp <- lme4::ranef(fm_ftp)[[1]]
+ran_ftp$roadStrength <- round(rank(ran_ftp$courseTypeTrail)/nrow(ran_ftp)*100, 1)
+fm_ttptm <- lme4::lmer(logTS ~ Course + 
+                   (1 + courseType + courseTime | Name), data=trimAC)
+ran_ttptm <- lme4::ranef(fm_ttptm)[[1]]
+ran_ttptm$speedStrength <- round(rank(ran_ttptm$courseTime)/nrow(ran_ttptm)*100, 1)
+fm <- lme4::lmer(logTS ~ course + 
+                   (1 | athlete), data=fastestAC)
+fastestAC <- fastestAC %>% dplyr::mutate(deviation=resid(fm)) 
 ```
 
 ### Take a name, give a table
 ```{r Name to table}
 name="Jean-Luc Jannink"
 devTab <- fastestAC %>% filter(athlete == name) %>% arrange(timeSec) %>% 
-  mutate(devPercent=round(deviation*100, 1)) %>% 
+  dplyr::mutate(devPercent=round(deviation*100, 1)) %>% 
   select(course, athlete, timeSec, devPercent) %>% 
-  mutate(targetSec=-round(timeSec*devPercent/100, 0)) %>% 
-  mutate(targetSec=if_else(targetSec < 0, targetSec, 0))
+  dplyr::mutate(targetSec=-round(timeSec*devPercent/100, 0)) %>% 
+  dplyr::mutate(targetSec=if_else(targetSec < 0, targetSec, 0))
+strength <- rank(ran_ftp$courseTypeTrail)
 print(devTab)
 ```
 
